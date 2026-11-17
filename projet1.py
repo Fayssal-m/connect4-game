@@ -85,7 +85,9 @@ def astar(start, goal, h):
             if nb not in best_g or ng < best_g[nb]:
                 best_g[nb] = ng
                 parent[nb] = state
-                heapq.heappush(open_heap, (ng + h(nb, goal), next(tie), ng, nb))
+                heapq.heappush(open_heap, (ng + h(nb, goal), next(
+                    
+                ), ng, nb))
 
     return None, trace
 
