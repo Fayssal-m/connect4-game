@@ -1,4 +1,4 @@
-"""Puissance 4 - game logic (no interface here, so the AI can reuse it)."""
+"""Puissance 4 - game logic"""
 
 ROWS, COLS = 6, 7
 EMPTY, P1, P2 = 0, 1, 2          # P1 = Red, P2 = Yellow
@@ -25,12 +25,6 @@ class Board:
                 return r
         return None
 
-    def undo(self, col):
-        """Remove the top piece of `col` (useful for MinMax later)."""
-        for r in range(ROWS):
-            if self.grid[r][col] != EMPTY:
-                self.grid[r][col] = EMPTY
-                return
 
     def copy(self):
         b = Board()
