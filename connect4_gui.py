@@ -12,7 +12,7 @@ from connect4_ai import AlphaBetaAI
 
 CELL = 90
 PAD = 8
-DEPTH = 8
+DEPTH = 6
 COLORS = {EMPTY: "white", P1: "red", P2: "gold"}
 NAMES = {P1: "Rouge", P2: "Jaune"}
 

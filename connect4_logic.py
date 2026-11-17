@@ -25,6 +25,14 @@ class Board:
                 return r
         return None
 
+    def undo(self, col):
+        """Remove the top piece of `col` (for Minimax backtracking)."""
+        for r in range(ROWS):
+            if self.grid[r][col] != EMPTY:
+                self.grid[r][col] = EMPTY
+                return r
+        return None
+
     def copy(self):
         """Independent copy (the AI thinks on a copy, never on the real board)."""
         b = Board()

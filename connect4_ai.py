@@ -1,214 +1,244 @@
-"""Puissance 4 - Computer player: MinMax with Alpha-Beta pruning.
+"""Puissance 4 - Simplified AI Module using Minimax with Alpha-Beta Pruning.
 
-The search works on BITBOARDS (one integer per player) instead of the
-6x7 grid, because a depth of 8 means hundreds of thousands of positions
-and plain Python lists would be too slow.
+This version uses the standard 2D board grid (no bitboards, no complex bitwise shifts),
+making it simple to understand, debug, and present.
 
-Bit layout: column c, row r (r = 0 is the BOTTOM) -> bit number c*7 + r.
-Each column has 7 bits: 6 for cells + 1 empty "sentinel" bit on top, which
-stops alignments from wrapping from one column to the next.
+Key components:
+1. Heuristic B: Evaluates all 69 possible 4-cell windows (horizontal, vertical, diagonal).
+2. Center bonus: Gives higher weight to the center column (column 3).
+3. Threats & Parity (Allis rule): Detects potential winning spots and scores them by row parity.
+4. Minimax with Alpha-Beta pruning: Explores the game tree efficiently.
+5. In-place Drop & Undo: Modifies and reverts the grid without heavy copying.
 """
-from connect4_logic import ROWS, COLS, EMPTY, P1
 
-H = ROWS + 1                          # bits per column (6 cells + sentinel)
-WIN_SCORE = 1_000_000                 # value of a won position
-INF = float("inf")
-COLUMN_ORDER = [3, 2, 4, 1, 5, 0, 6]  # try the centre first (better pruning)
+from connect4_logic import ROWS, COLS, EMPTY, P1, P2
 
-popcount = int.bit_count if hasattr(int, "bit_count") else (lambda x: bin(x).count("1"))
+# Center-out order: column 3 is tested first, then columns 2 and 4, etc.
+# This causes Alpha-Beta to prune bad branches much earlier.
+COLUMN_ORDER = [3, 2, 4, 1, 5, 0, 6]
 
-# ---------------------------------------------------------------- heuristic
-W2 = 5                  # window with 2 of my pieces + 2 empty
-W3 = 20                 # window with 3 of my pieces + 1 empty
-THREAT_GOOD = 40        # threat cell on the row that parity favours
-THREAT_OTHER = 10       # threat cell on the other rows
-CENTER_WEIGHT = [1, 2, 3, 4, 3, 2, 1]   # bonus per piece, by column
+WIN_SCORE = 1_000_000
 
 
-def _bit(col, row):
-    return 1 << (col * H + row)
-
-
-def _build_windows():
-    """Every group of 4 aligned cells on the board, as a bit mask (69 total)."""
+def build_all_windows():
+    r"""Precompute all 69 groups of 4 connected cells on a 6x7 board.
+    
+    - 24 horizontal windows
+    - 21 vertical windows
+    - 12 diagonal / windows
+    - 12 diagonal \ windows
+    """
     windows = []
-    for col in range(COLS):
-        for row in range(ROWS):
-            for dc, dr in ((1, 0), (0, 1), (1, 1), (1, -1)):
-                cells = [(col + i * dc, row + i * dr) for i in range(4)]
-                if all(0 <= c < COLS and 0 <= r < ROWS for c, r in cells):
-                    windows.append(sum(_bit(c, r) for c, r in cells))
+    # Horizontal
+    for r in range(ROWS):
+        for c in range(COLS - 3):
+            windows.append([(r, c + i) for i in range(4)])
+    # Vertical
+    for r in range(ROWS - 3):
+        for c in range(COLS):
+            windows.append([(r + i, c) for i in range(4)])
+    # Diagonal / (bottom-left to top-right)
+    for r in range(3, ROWS):
+        for c in range(COLS - 3):
+            windows.append([(r - i, c + i) for i in range(4)])
+    # Diagonal \ (top-left to bottom-right)
+    for r in range(ROWS - 3):
+        for c in range(COLS - 3):
+            windows.append([(r + i, c + i) for i in range(4)])
     return windows
 
 
-WINDOWS = _build_windows()
-COLUMN_MASK = [((1 << ROWS) - 1) << (c * H) for c in range(COLS)]
+WINDOWS = build_all_windows()
 
 
-def is_win(b):
-    """True if bitboard `b` contains 4 aligned pieces."""
-    for s in (1, H, H - 1, H + 1):        # vertical, horizontal, 2 diagonals
-        m = b & (b >> s)
-        if m & (m >> (2 * s)):
+def is_fast_win(grid, r, c, player):
+    """Check if the piece dropped at (r, c) creates 4 aligned pieces for player."""
+    for dr, dc in [(0, 1), (1, 0), (1, 1), (1, -1)]:
+        count = 1
+        # Check forward along the direction
+        i = 1
+        while 0 <= r + i * dr < ROWS and 0 <= c + i * dc < COLS and grid[r + i * dr][c + i * dc] == player:
+            count += 1
+            i += 1
+        # Check backward along the opposite direction
+        i = 1
+        while 0 <= r - i * dr < ROWS and 0 <= c - i * dc < COLS and grid[r - i * dr][c - i * dc] == player:
+            count += 1
+            i += 1
+        if count >= 4:
             return True
     return False
 
 
-def _threat_value(threats, owner_is_first):
-    """Score the empty cells that would complete a 4 for one player.
-
-    Parity rule (zugzwang): when the board fills up, the FIRST player
-    tends to get the odd rows (1,3,5 counted from the bottom) and the
-    SECOND player the even rows (2,4,6). A threat on "your" parity is worth more.
-    """
-    total = 0
-    while threats:
-        low = threats & -threats            # isolate one threat cell
-        threats ^= low
-        row = (low.bit_length() - 1) % H + 1   # 1..6, from the bottom
-        good = (row % 2 == 1) if owner_is_first else (row % 2 == 0)
-        total += THREAT_GOOD if good else THREAT_OTHER
-    return total
-
-
-def evaluate(ai, hu, ai_is_first):
-    """Heuristic value of a position, from the computer's point of view."""
-    occupied = ai | hu
+def evaluate_board(board, ai_player):
+    """Heuristic function: gives a numerical score to a board state."""
+    hu_player = P2 if ai_player == P1 else P1
+    grid = board.grid
     score = 0
-    ai_threats = hu_threats = 0
+    ai_threats = []
+    hu_threats = []
 
-    # 1) window scoring (+ collect the threat cells)
+    # 1. Evaluate all 69 windows (Heuristic B)
     for w in WINDOWS:
-        a = popcount(ai & w)
-        h = popcount(hu & w)
-        if a and h:
-            continue                         # dead window: nobody can finish it
-        if h == 0:
-            if a == 2:
-                score += W2
-            elif a == 3:
-                score += W3
-                ai_threats |= w & ~occupied
-        elif a == 0:
-            if h == 2:
-                score -= W2
-            elif h == 3:
-                score -= W3
-                hu_threats |= w & ~occupied
+        vals = [grid[r][c] for r, c in w]
+        ai_count = vals.count(ai_player)
+        hu_count = vals.count(hu_player)
+        empty_count = vals.count(EMPTY)
 
-    # 2) centre bonus
-    for c in range(COLS):
-        mask = COLUMN_MASK[c]
-        score += CENTER_WEIGHT[c] * (popcount(ai & mask) - popcount(hu & mask))
+        # If both players have pieces in this window, nobody can win with it
+        if ai_count > 0 and hu_count > 0:
+            continue
 
-    # 3) threats + parity
-    score += _threat_value(ai_threats, ai_is_first)
-    score -= _threat_value(hu_threats, not ai_is_first)
+        if ai_count == 3 and empty_count == 1:
+            score += 20
+            # Check if this empty spot is an unplayable threat (not yet supported)
+            for r, c in w:
+                if grid[r][c] == EMPTY and r < ROWS - 1 and grid[r + 1][c] == EMPTY:
+                    ai_threats.append((r, c))
+        elif ai_count == 2 and empty_count == 2:
+            score += 5
+
+        if hu_count == 3 and empty_count == 1:
+            score -= 20
+            for r, c in w:
+                if grid[r][c] == EMPTY and r < ROWS - 1 and grid[r + 1][c] == EMPTY:
+                    hu_threats.append((r, c))
+        elif hu_count == 2 and empty_count == 2:
+            score -= 5
+
+    # 2. Center Column Bonus (Column 3)
+    # The center column offers the highest tactical value
+    for r in range(ROWS):
+        if grid[r][3] == ai_player:
+            score += 4
+        elif grid[r][3] == hu_player:
+            score -= 4
+
+    # 3. Threat Parity (Victor Allis Rule)
+    # Player 1 naturally controls odd rows (1, 3, 5 from bottom)
+    # Player 2 controls even rows (2, 4, 6 from bottom)
+    for r, c in set(ai_threats):
+        row_height = ROWS - r  # 1 at the bottom, 6 at the top
+        favorable = (row_height % 2 == 1) if ai_player == P1 else (row_height % 2 == 0)
+        score += 40 if favorable else 10
+
+    for r, c in set(hu_threats):
+        row_height = ROWS - r
+        favorable = (row_height % 2 == 1) if hu_player == P1 else (row_height % 2 == 0)
+        score -= 40 if favorable else 10
+
     return score
 
 
-# ------------------------------------------------------------------- search
 class AlphaBetaAI:
-    def __init__(self, depth=8):
-        self.depth = depth
-        self.nodes = 0                      # positions explored (for statistics)
-        self.ai_is_first = False
+    """Minimax AI with Alpha-Beta pruning."""
 
-    def best_move(self, board, ai_player):
-        """Return the best column for `ai_player` on `board`."""
-        ai, hu, heights, played = self._to_bitboards(board, ai_player)
-        self.ai_is_first = (ai_player == P1)
+    def __init__(self, depth=5):
+        self.depth = depth
         self.nodes = 0
 
-        if played == 0:
-            return COLS // 2                # opening: the centre column is best
+    def best_move(self, board, ai_player):
+        """Find the best column for ai_player."""
+        self.nodes = 0
+        valid_cols = board.valid_columns()
 
-        best_col, best_val = None, -INF
-        alpha, beta = -INF, INF
-        for c in COLUMN_ORDER:
-            if heights[c] >= ROWS:
-                continue
-            new_ai = ai | (1 << (c * H + heights[c]))
-            if is_win(new_ai):
-                return c                    # winning move: play it
-            heights[c] += 1
-            val = self._min_value(new_ai, hu, heights, self.depth - 1,
-                                  alpha, beta, played + 1)
-            heights[c] -= 1
-            if val > best_val:
-                best_val, best_col = val, c
-            alpha = max(alpha, val)
+        if not valid_cols:
+            return None
+
+        # Optimization: play center on empty board
+        if len(valid_cols) == COLS and all(board.grid[ROWS - 1][c] == EMPTY for c in range(COLS)):
+            return 3
+
+        hu_player = P2 if ai_player == P1 else P1
+
+        # Check immediate win or immediate block at root (depth 1 check)
+        for c in valid_cols:
+            r = board.drop(c, ai_player)
+            if is_fast_win(board.grid, r, c, ai_player):
+                board.undo(c)
+                return c
+            board.undo(c)
+
+        for c in valid_cols:
+            r = board.drop(c, hu_player)
+            if is_fast_win(board.grid, r, c, hu_player):
+                board.undo(c)
+                return c
+            board.undo(c)
+
+        # Minimax recursive search
+        best_col, _ = self._max_value(
+            board=board,
+            depth=self.depth,
+            alpha=-float("inf"),
+            beta=float("inf"),
+            ai_player=ai_player,
+            hu_player=hu_player
+        )
         return best_col
 
-    def _max_value(self, ai, hu, heights, depth, alpha, beta, played):
-        """Computer's turn: choose the move with the HIGHEST value."""
+    def _max_value(self, board, depth, alpha, beta, ai_player, hu_player):
         self.nodes += 1
-        if played == ROWS * COLS:
-            return 0                        # board full: draw
-        if depth == 0:
-            return evaluate(ai, hu, self.ai_is_first)
-        value = -INF
-        for c in COLUMN_ORDER:
-            if heights[c] >= ROWS:
-                continue
-            new_ai = ai | (1 << (c * H + heights[c]))
-            if is_win(new_ai):
-                return WIN_SCORE + depth    # + depth: prefer a FASTER win
-            heights[c] += 1
-            v = self._min_value(new_ai, hu, heights, depth - 1,
-                                alpha, beta, played + 1)
-            heights[c] -= 1
-            if v > value:
-                value = v
-            if value > alpha:
-                alpha = value
-            if alpha >= beta:
-                break                       # beta cut-off: MIN will avoid this branch
-        return value
+        valid_cols = board.valid_columns()
 
-    def _min_value(self, ai, hu, heights, depth, alpha, beta, played):
-        """Opponent's turn: assume they choose the move with the LOWEST value."""
+        if not valid_cols:
+            return None, 0  # Draw
+
+        if depth == 0:
+            return None, evaluate_board(board, ai_player)
+
+        ordered_cols = [c for c in COLUMN_ORDER if c in valid_cols]
+        best_val = -float("inf")
+        best_col = ordered_cols[0]
+
+        for col in ordered_cols:
+            r = board.drop(col, ai_player)
+            if is_fast_win(board.grid, r, col, ai_player):
+                board.undo(col)
+                return col, WIN_SCORE + depth
+
+            _, val = self._min_value(board, depth - 1, alpha, beta, ai_player, hu_player)
+            board.undo(col)
+
+            if val > best_val:
+                best_val = val
+                best_col = col
+
+            alpha = max(alpha, best_val)
+            if alpha >= beta:
+                break  # Beta cut-off
+
+        return best_col, best_val
+
+    def _min_value(self, board, depth, alpha, beta, ai_player, hu_player):
         self.nodes += 1
-        if played == ROWS * COLS:
-            return 0
-        if depth == 0:
-            return evaluate(ai, hu, self.ai_is_first)
-        value = INF
-        for c in COLUMN_ORDER:
-            if heights[c] >= ROWS:
-                continue
-            new_hu = hu | (1 << (c * H + heights[c]))
-            if is_win(new_hu):
-                return -(WIN_SCORE + depth)  # opponent wins (sooner = worse)
-            heights[c] += 1
-            v = self._max_value(ai, new_hu, heights, depth - 1,
-                                alpha, beta, played + 1)
-            heights[c] -= 1
-            if v < value:
-                value = v
-            if value < beta:
-                beta = value
-            if alpha >= beta:
-                break                       # alpha cut-off: MAX will avoid this branch
-        return value
+        valid_cols = board.valid_columns()
 
-    @staticmethod
-    def _to_bitboards(board, ai_player):
-        """Convert the grid (list of lists) into two bitboards + column heights."""
-        ai = hu = played = 0
-        heights = [0] * COLS
-        for c in range(COLS):
-            h = 0
-            for r in range(ROWS - 1, -1, -1):        # grid bottom -> top
-                v = board.grid[r][c]
-                if v == EMPTY:
-                    break
-                bit = 1 << (c * H + h)
-                if v == ai_player:
-                    ai |= bit
-                else:
-                    hu |= bit
-                h += 1
-            heights[c] = h
-            played += h
-        return ai, hu, heights, played
+        if not valid_cols:
+            return None, 0
+
+        if depth == 0:
+            return None, evaluate_board(board, ai_player)
+
+        ordered_cols = [c for c in COLUMN_ORDER if c in valid_cols]
+        best_val = float("inf")
+        best_col = ordered_cols[0]
+
+        for col in ordered_cols:
+            r = board.drop(col, hu_player)
+            if is_fast_win(board.grid, r, col, hu_player):
+                board.undo(col)
+                return col, -(WIN_SCORE + depth)
+
+            _, val = self._max_value(board, depth - 1, alpha, beta, ai_player, hu_player)
+            board.undo(col)
+
+            if val < best_val:
+                best_val = val
+                best_col = col
+
+            beta = min(beta, best_val)
+            if beta <= alpha:
+                break  # Alpha cut-off
+
+        return best_col, best_val
